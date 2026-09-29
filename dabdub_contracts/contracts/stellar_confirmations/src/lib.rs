@@ -13,6 +13,7 @@ enum DataKey {
     PaymentConfs(BytesN<32>),   // confirmed count so far for a payment (u32)
     PaymentFirstLedger(BytesN<32>), // ledger_seq of the first confirmation
     PaymentSettling(BytesN<32>),    // bool — already transitioned
+    PaymentFailed(BytesN<32>),      // bool — terminal failure state
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -31,6 +32,13 @@ struct SettlementAuthorisedEvent {
     ledger_seq: u32,   // ledger that pushed count over threshold
     amount: i128,      // informational — set by caller
     merchant: Address, // informational — set by caller
+}
+
+#[contracttype]
+struct ConfirmationFailedEvent {
+    payment_id: BytesN<32>,
+    confirmations: u32, // confirmations accumulated at time of failure
+    required: u32,
 }
 
 // ── contract ─────────────────────────────────────────────────────────────────
@@ -67,6 +75,12 @@ impl StellarConfirmationsContract {
         let settling_key = DataKey::PaymentSettling(payment_id.clone());
         if env.storage().persistent().get::<_, bool>(&settling_key).unwrap_or(false) {
             panic!("payment already settling");
+        }
+
+        // Guard: already failed — terminal state, cannot resume confirming
+        let failed_key = DataKey::PaymentFailed(payment_id.clone());
+        if env.storage().persistent().get::<_, bool>(&failed_key).unwrap_or(false) {
+            panic!("payment already failed");
         }
 
         // Increment confirmation counter
@@ -111,6 +125,46 @@ impl StellarConfirmationsContract {
         new_confs
     }
 
+    /// Admin: mark a stuck, sub-threshold payment as failed. This is the
+    /// terminal failure state for a payment that never accumulates enough
+    /// confirmations (e.g. a chain reorg or monitoring gap), mirroring the
+    /// `fail` pattern in the `payment_request` contract.
+    pub fn fail_confirmation(env: Env, caller: Address, payment_id: BytesN<32>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        // Guard: cannot fail a payment that has already crossed the
+        // threshold and is settling — that path is final.
+        let settling_key = DataKey::PaymentSettling(payment_id.clone());
+        if env.storage().persistent().get::<_, bool>(&settling_key).unwrap_or(false) {
+            panic!("payment already settling");
+        }
+
+        // Guard: idempotent — cannot fail an already-failed payment.
+        let failed_key = DataKey::PaymentFailed(payment_id.clone());
+        if env.storage().persistent().get::<_, bool>(&failed_key).unwrap_or(false) {
+            panic!("payment already failed");
+        }
+
+        env.storage().persistent().set(&failed_key, &true);
+
+        let confs: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PaymentConfs(payment_id.clone()))
+            .unwrap_or(0);
+        let required: u32 = env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
+
+        env.events().publish(
+            ("STELLAR_CONFS", "confirmation_failed"),
+            ConfirmationFailedEvent {
+                payment_id,
+                confirmations: confs,
+                required,
+            },
+        );
+    }
+
     /// Admin: update the required confirmation count.
     pub fn set_confirmation_count(env: Env, caller: Address, count: u32) {
         caller.require_auth();
@@ -134,6 +188,13 @@ impl StellarConfirmationsContract {
         env.storage()
             .persistent()
             .get(&DataKey::PaymentSettling(payment_id))
+            .unwrap_or(false)
+    }
+
+    pub fn is_failed(env: Env, payment_id: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentFailed(payment_id))
             .unwrap_or(false)
     }
 
