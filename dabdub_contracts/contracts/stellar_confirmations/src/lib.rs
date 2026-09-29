@@ -2,7 +2,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, BytesN, Env, Address};
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, BytesN, Env, Address};
 
 // ── storage keys ────────────────────────────────────────────────────────────
 
@@ -14,6 +14,48 @@ enum DataKey {
     PaymentFirstLedger(BytesN<32>), // ledger_seq of the first confirmation
     PaymentSettling(BytesN<32>),    // bool — already transitioned
     PaymentFailed(BytesN<32>),      // bool — terminal failure state
+    PaymentEscrowContract,      // optional Address of the payment_escrow contract
+}
+
+// ── cross-contract client ────────────────────────────────────────────────────
+
+/// Thin client interface mirroring the payment_escrow contract's
+/// `PaymentEscrow` record, used to cross-check `amount`/`merchant`
+/// before emitting `SettlementAuthorisedEvent`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaymentEscrow {
+    pub payment_id: BytesN<32>,
+    pub amount: i128,
+    pub released_amount: i128,
+    pub merchant: Address,
+    pub customer: Address,
+    pub status: PaymentEscrowStatus,
+    pub expiry: u32,
+    pub dispute_window_end: u32,
+    pub dispute_reason: Option<soroban_sdk::String>,
+    pub asset_type: PaymentEscrowAssetType,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaymentEscrowStatus {
+    Pending,
+    Disputed,
+    Released,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaymentEscrowAssetType {
+    Xlm,
+    Usdc,
+}
+
+#[contractclient(name = "PaymentEscrowClient")]
+pub trait PaymentEscrowInterface {
+    fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow;
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -57,7 +99,11 @@ impl StellarConfirmationsContract {
     /// Called by the NestJS monitor once per observed Stellar ledger close.
     /// `ledger_seq` is the sequence number of the closed ledger.
     /// `amount` and `merchant` are forwarded into the SettlementAuthorised event
-    /// so NestJS can trigger the fiat payout without a second lookup.
+    /// so NestJS can trigger the fiat payout without a second lookup. When a
+    /// payment_escrow contract has been configured via
+    /// `set_payment_escrow_contract`, the final threshold-crossing call
+    /// cross-checks `amount`/`merchant` against `payment_escrow::get_payment`
+    /// and panics on a mismatch rather than trusting the caller blindly.
     ///
     /// Returns the current confirmation count after this call.
     pub fn confirm_payment(
@@ -109,6 +155,16 @@ impl StellarConfirmationsContract {
 
         // Transition to Settling when threshold is reached
         if new_confs >= required {
+            // If a payment_escrow contract is configured, cross-check the
+            // caller-supplied amount/merchant against the real escrow record
+            // before trusting them to trigger an off-chain payout.
+            if let Some(escrow_address) = Self::get_payment_escrow_contract(env.clone()) {
+                let escrow_client = PaymentEscrowClient::new(&env, &escrow_address);
+                let payment = escrow_client.get_payment(&payment_id);
+                assert!(payment.amount == amount, "amount mismatch with payment_escrow");
+                assert!(payment.merchant == merchant, "merchant mismatch with payment_escrow");
+            }
+
             env.storage().persistent().set(&settling_key, &true);
 
             env.events().publish(
@@ -163,6 +219,18 @@ impl StellarConfirmationsContract {
                 required,
             },
         );
+    }
+
+    /// Admin: set (or clear) the payment_escrow contract address used to
+    /// cross-check amount/merchant before settlement is authorised.
+    pub fn set_payment_escrow_contract(env: Env, caller: Address, payment_escrow: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::PaymentEscrowContract, &payment_escrow);
+    }
+
+    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PaymentEscrowContract)
     }
 
     /// Admin: update the required confirmation count.
